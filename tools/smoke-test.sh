@@ -2,7 +2,7 @@
 # End-to-end check of the whole stack without Claude Code's UI:
 # plans an automatic finance run, accepts the recommended plugin if a person is asked,
 # approves the variance review, then evaluates, replays and verifies the audit chain.
-# Needs: docker compose up (Temporal, engine API, workers and services).
+# Needs the stack running: tools/compose.sh up -d (Docker Compose or podman-compose).
 # Plugin choices are made by the analyst who started the run; approvals by the finance lead,
 # because the recipe forbids the runner from approving their own run.
 set -eu

@@ -46,6 +46,35 @@ tools/smoke-test.sh                 # plan → choose plugin → approval (refus
 open http://localhost:8233          # Temporal UI: every run's full history
 ```
 
+### With Podman
+
+The same files work with Podman and podman-compose (tested with Podman 4.9 and podman-compose 1.6). Use `podman-compose` where this README says `docker compose`, or `tools/compose.sh`, which picks whichever tool is installed (set `COMPOSE=podman-compose` to force it).
+
+```bash
+cp .env.example .env
+podman-compose up -d --build
+podman logs -f recipe-orchestrator-temporal-poc_registry_1   # wait for "initial index", then Ctrl-C
+tools/smoke-test.sh
+```
+
+What is different with Podman, and already handled in `docker-compose.yml` and the Dockerfiles:
+
+- **Image names are fully qualified** (`docker.io/...`). Podman does not assume Docker Hub, and short names such as `pgvector/pgvector` fail with "short-name did not resolve to an alias".
+- **Health checks are in `docker-compose.yml`.** Podman builds OCI images, which drop Dockerfile `HEALTHCHECK` instructions, so a health check there never runs and dependent services never start.
+- **The engine image is built once**, by `engine-api`. podman-compose builds every service (and replica) that has a `build:` section, in parallel; seven copies of the engine build exhausted disk space in testing.
+- **Proxy variables.** Podman copies the host's `http_proxy`/`https_proxy` into containers. `NO_PROXY` keeps traffic between services (Temporal, Postgres, registry, ...) off the proxy; without it the engine cannot reach Temporal behind a corporate proxy.
+- **SELinux.** Bind mounts carry `:z`, so Fedora and RHEL hosts allow the containers to read `recipes/`, `contracts/` and `marketplace/`.
+- **Replicas** use `scale:` (podman-compose ignores `deploy.replicas` unless a deploy mode is set; Docker warns about the mode outside Swarm).
+- **Restart policies** on every service, so a container that starts before its dependency is ready simply restarts.
+
+Things to know when running it:
+
+- **Health checks need systemd.** Podman runs health checks from systemd timers. Without systemd (WSL2 without systemd, CI containers, minimal VMs) containers stay `starting` and `podman-compose up` waits for ever. Run `tools/podman-healthchecks.sh &` first; it runs the checks itself. Not needed on normal Linux hosts or with `podman machine` on macOS and Windows.
+- **Scaling.** `podman-compose up -d --scale worker-ai=2` takes one service per command. `podman-compose down` removes only the containers the compose file defines: remove extra scaled containers with `podman rm -f <name>`.
+- **Resource limits** (`deploy.resources.limits` on `worker-code`) need cgroups v2 with the cpu and memory controllers delegated to your user when rootless (the default on current Fedora and Ubuntu). If container creation fails with a cgroup error, delete those two lines.
+- **Memory.** The stack used about 0.9 GB idle in testing (without the embedding model); allow 4 GB for real runs. With `podman machine` on macOS or Windows, create the machine with `--memory 4096` or more.
+- **Failure drills** work the same: `podman kill recipe-orchestrator-temporal-poc_worker-orchestrator_1 recipe-orchestrator-temporal-poc_worker-code_1`, then `podman-compose up -d`.
+
 From Claude Code:
 
 ```bash

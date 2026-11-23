@@ -21,7 +21,7 @@ if git ls-remote "$url" >/dev/null 2>&1; then
   git clone -q "$url" "$work" 2>/dev/null || git init -q -b main "$work"
 else
   echo "Creating repository for new plugin $plugin"
-  docker compose exec -T git-server create-repo.sh "$plugin"
+  tools/compose.sh exec -T git-server create-repo.sh "$plugin"
   git init -q -b main "$work"
 fi
 git -C "$work" config core.fileMode false

@@ -1,10 +1,21 @@
 # Recipe orchestrator POC on Temporal: everything runs in containers, the way the central
 # service would. The thin client (Plugin X in Claude Code) connects to engine-api on :7400.
+#
+# Works with Docker Compose and with Podman (tested with podman-compose 1.6):
+#   - image names are fully qualified (docker.io/...), because Podman does not guess registries;
+#   - bind mounts carry the :z label so SELinux hosts (Fedora, RHEL) let containers read them;
+#   - health checks live here, not in Dockerfiles (Podman builds OCI images, which drop HEALTHCHECK);
+#   - every service restarts on failure, so the stack also comes up if start order is not enforced;
+#   - the engine image is built once (by engine-api) and reused by the workers;
+#   - NO_PROXY keeps traffic between services off any proxy Podman passes in from the host.
+# Without systemd, Podman does not run health checks: start tools/podman-healthchecks.sh first.
 name: recipe-orchestrator-temporal-poc
 
+# One engine image for the API and every worker. Only engine-api builds it: compose tools
+# that build per service (podman-compose does) would otherwise build it seven times at once.
 x-engine: &engine
-  build: ./engine
-  image: recipe-engine-temporal:local
+  image: localhost/recipe-engine-temporal:local
+  pull_policy: never
   environment: &engine-env
     TEMPORAL_ADDRESS: temporal:7233
     DATABASE_URL: postgres://poc:poc@postgres:5432/orchestrator
@@ -23,11 +34,15 @@ x-engine: &engine
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ENGINE_TOKENS: ${ENGINE_TOKENS:-dev-analyst-token:analyst@example.com:analyst,dev-lead-token:lead@example.com:analyst|finance-lead|ops-lead,dev-auditor-token:auditor@example.com:auditor,dev-admin-token:admin@example.com:admin|plugin-owner}
     MAX_ACTIVE_RUNS_PER_USER: ${MAX_ACTIVE_RUNS_PER_USER:-10}
+    # Podman copies the host's proxy variables into containers (Docker does not). Keep traffic
+    # between services off the proxy; calls to the Anthropic API still use it.
+    NO_PROXY: &no-proxy localhost,127.0.0.1,temporal,postgres,registry,embeddings,git-server,mock-data,engine-api
+    no_proxy: *no-proxy
   volumes:
     - engine-data:/data
-    - ./recipes:/app/recipes:ro
-    - ./contracts:/app/contracts:ro
-    - ./marketplace:/app/marketplace:ro
+    - ./recipes:/app/recipes:ro,z
+    - ./contracts:/app/contracts:ro,z
+    - ./marketplace:/app/marketplace:ro,z
   depends_on:
     temporal:
       condition: service_healthy
@@ -38,7 +53,7 @@ x-engine: &engine
 services:
   # Capability registry index (pgvector) and central audit store.
   postgres:
-    image: pgvector/pgvector:pg16
+    image: docker.io/pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: poc
       POSTGRES_PASSWORD: poc
@@ -47,7 +62,8 @@ services:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro,z
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U poc -d orchestrator"]
       interval: 5s
@@ -62,7 +78,8 @@ services:
       - "9418:9418"
     volumes:
       - marketplace-git:/srv/git
-      - ./marketplace/plugins:/seed/plugins:ro
+      - ./marketplace/plugins:/seed/plugins:ro,z
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/seeded"]
       interval: 5s
@@ -74,12 +91,19 @@ services:
     build: ./infra/embeddings
     ports:
       - "7200:7200"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7200/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # Mock external data sources (FX rates, inventory) exposed as MCP tools.
   mock-data:
     build: ./infra/mock-data-mcp
     ports:
       - "7310:7310"
+    restart: unless-stopped
 
   # Capability registry: indexes the marketplace and serves hybrid search over MCP.
   registry:
@@ -91,11 +115,14 @@ services:
       EMBEDDINGS_URL: http://embeddings:7200
       POLICY_FILE: /policy/policy.json
       REINDEX_INTERVAL_SEC: "60"
+      NO_PROXY: *no-proxy
+      no_proxy: *no-proxy
     ports:
       - "7300:7300"
     volumes:
       - marketplace-git:/srv/git:ro
-      - ./marketplace/policy.json:/policy/policy.json:ro
+      - ./marketplace/policy.json:/policy/policy.json:ro,z
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,7 +133,7 @@ services:
 
   # Temporal: durable workflow engine (dev server with SQLite; UI on :8233).
   temporal:
-    image: temporalio/temporal:latest
+    image: docker.io/temporalio/temporal:latest
     user: "0:0"   # write the SQLite database to the named volume
     command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/temporal/temporal.db"]
     ports:
@@ -114,6 +141,7 @@ services:
       - "8233:8233"
     volumes:
       - temporal-data:/temporal
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
       interval: 5s
@@ -123,6 +151,8 @@ services:
   # Engine API: stateless MCP server for the thin client. Can be replicated.
   engine-api:
     <<: *engine
+    build: ./engine
+    pull_policy: build   # always build locally, never try to pull this image (cached layers keep it fast)
     command: ["node", "dist/api/index.js"]
     environment:
       <<: *engine-env
@@ -131,11 +161,12 @@ services:
       - "7400:7400"
     volumes:
       - engine-data:/data
-      - ./recipes:/app/recipes:ro
-      - ./contracts:/app/contracts:ro
-      - ./marketplace:/app/marketplace   # writable: card generation writes new plugin versions
+      - ./recipes:/app/recipes:ro,z
+      - ./contracts:/app/contracts:ro,z
+      - ./marketplace:/app/marketplace:z   # writable: card generation writes new plugin versions
 
   # Worker pools, one per task queue. Scale any of them: docker compose up -d --scale worker-code=4
+  # (podman-compose takes one --scale per command; or change `scale:` below)
   worker-orchestrator:
     <<: *engine
     command: ["node", "dist/worker.js", "--role", "orchestrator"]
@@ -147,8 +178,8 @@ services:
   worker-code:
     <<: *engine
     command: ["node", "dist/worker.js", "--role", "code"]
+    scale: 2   # understood by Docker Compose and podman-compose (podman-compose ignores deploy.replicas)
     deploy:
-      replicas: 2
       resources:
         limits: { cpus: "2", memory: 2g }
 
