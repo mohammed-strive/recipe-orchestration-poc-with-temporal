@@ -1,0 +1,171 @@
+# Recipe orchestrator POC on Temporal: everything runs in containers, the way the central
+# service would. The thin client (Plugin X in Claude Code) connects to engine-api on :7400.
+name: recipe-orchestrator-temporal-poc
+
+x-engine: &engine
+  build: ./engine
+  image: recipe-engine-temporal:local
+  environment: &engine-env
+    TEMPORAL_ADDRESS: temporal:7233
+    DATABASE_URL: postgres://poc:poc@postgres:5432/orchestrator
+    REGISTRY_URL: http://registry:7300/mcp
+    EMBEDDINGS_URL: http://embeddings:7200
+    GIT_BASE_URL: git://git-server:9418
+    MCP_URL_REWRITE: localhost:7310=mock-data:7310
+    DATA_DIR: /data
+    RECIPES_DIR: /app/recipes
+    CONTRACTS_DIR: /app/contracts
+    MARKETPLACE_SRC: /app/marketplace/plugins
+    POLICY_FILE: /app/marketplace/policy.json
+    AGENT_RUNNER: ${AGENT_RUNNER:-claude}
+    RERANK: ${RERANK:-claude}
+    DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-sonnet-5-5}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ENGINE_TOKENS: ${ENGINE_TOKENS:-dev-analyst-token:analyst@example.com:analyst,dev-lead-token:lead@example.com:analyst|finance-lead|ops-lead,dev-auditor-token:auditor@example.com:auditor,dev-admin-token:admin@example.com:admin|plugin-owner}
+    MAX_ACTIVE_RUNS_PER_USER: ${MAX_ACTIVE_RUNS_PER_USER:-10}
+  volumes:
+    - engine-data:/data
+    - ./recipes:/app/recipes:ro
+    - ./contracts:/app/contracts:ro
+    - ./marketplace:/app/marketplace:ro
+  depends_on:
+    temporal:
+      condition: service_healthy
+    registry:
+      condition: service_started
+  restart: unless-stopped
+
+services:
+  # Capability registry index (pgvector) and central audit store.
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poc -d orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Mock private plugin marketplace: one git repo per plugin, one tag per version.
+  # Seeded from ./marketplace/plugins on first start (deterministic commit SHAs).
+  git-server:
+    build: ./infra/git-server
+    ports:
+      - "9418:9418"
+    volumes:
+      - marketplace-git:/srv/git
+      - ./marketplace/plugins:/seed/plugins:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/seeded"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Local embedding model (BAAI/bge-small-en-v1.5, downloaded at build time).
+  embeddings:
+    build: ./infra/embeddings
+    ports:
+      - "7200:7200"
+
+  # Mock external data sources (FX rates, inventory) exposed as MCP tools.
+  mock-data:
+    build: ./infra/mock-data-mcp
+    ports:
+      - "7310:7310"
+
+  # Capability registry: indexes the marketplace and serves hybrid search over MCP.
+  registry:
+    build: ./registry
+    environment:
+      DATABASE_URL: postgres://poc:poc@postgres:5432/orchestrator
+      GIT_REPOS_DIR: /srv/git
+      GIT_PUBLIC_URL: git://localhost:9418
+      EMBEDDINGS_URL: http://embeddings:7200
+      POLICY_FILE: /policy/policy.json
+      REINDEX_INTERVAL_SEC: "60"
+    ports:
+      - "7300:7300"
+    volumes:
+      - marketplace-git:/srv/git:ro
+      - ./marketplace/policy.json:/policy/policy.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      git-server:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+
+  # Temporal: durable workflow engine (dev server with SQLite; UI on :8233).
+  temporal:
+    image: temporalio/temporal:latest
+    user: "0:0"   # write the SQLite database to the named volume
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/temporal/temporal.db"]
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporal-data:/temporal
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Engine API: stateless MCP server for the thin client. Can be replicated.
+  engine-api:
+    <<: *engine
+    command: ["node", "dist/api/index.js"]
+    environment:
+      <<: *engine-env
+      ENGINE_HOST: 0.0.0.0
+    ports:
+      - "7400:7400"
+    volumes:
+      - engine-data:/data
+      - ./recipes:/app/recipes:ro
+      - ./contracts:/app/contracts:ro
+      - ./marketplace:/app/marketplace   # writable: card generation writes new plugin versions
+
+  # Worker pools, one per task queue. Scale any of them: docker compose up -d --scale worker-code=4
+  worker-orchestrator:
+    <<: *engine
+    command: ["node", "dist/worker.js", "--role", "orchestrator"]
+
+  worker-discovery:
+    <<: *engine
+    command: ["node", "dist/worker.js", "--role", "discovery"]
+
+  worker-code:
+    <<: *engine
+    command: ["node", "dist/worker.js", "--role", "code"]
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "2", memory: 2g }
+
+  worker-tool:
+    <<: *engine
+    command: ["node", "dist/worker.js", "--role", "tool"]
+
+  worker-ai:
+    <<: *engine
+    command: ["node", "dist/worker.js", "--role", "ai"]
+    environment:
+      <<: *engine-env
+      AI_CONCURRENCY: ${AI_CONCURRENCY:-4}
+      AI_RATE_PER_SEC: ${AI_RATE_PER_SEC:-2}
+
+volumes:
+  pgdata:
+  marketplace-git:
+  engine-data:
+  temporal-data:

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "recipe-engine": {
+      "type": "http",
+      "url": "http://localhost:7400/mcp",
+      "headers": { "Authorization": "Bearer ${RECIPE_ENGINE_TOKEN:-dev-analyst-token}" }
+    },
+    "capability-registry": { "type": "http", "url": "http://localhost:7300/mcp" }
+  }
+}

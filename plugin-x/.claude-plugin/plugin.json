@@ -1,0 +1,8 @@
+{
+  "name": "plugin-x",
+  "version": "0.2.0",
+  "description": "Find and run analysis recipes on the Temporal-based recipe engine (POC). A thin, authenticated front end.",
+  "author": {
+    "name": "Recipe Orchestrator POC"
+  }
+}
