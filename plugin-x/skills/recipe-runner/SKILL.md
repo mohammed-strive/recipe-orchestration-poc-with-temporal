@@ -34,7 +34,7 @@ For each pending selection, show a short table of candidates: component, kind, c
 - Interactive runs: after selections, call `start_run`. Automatic runs start on their own.
 - Poll with `get_run` using `wait_seconds: 20`. Report progress briefly: steps completed, loops, fallbacks used (`fallback_from`), retries.
 - If `status` is `needs_selection` during the run (a step resolved at runtime), handle it as in step 3.
-- If `status` is `waiting_approval`, show `pending_approval.message`, the required `role`, whether the person who started the run is excluded (`exclude_runner`), and the expiry. If the current user may approve, ask them and call `approve_step` with their decision and note. Otherwise tell them who must approve (someone with that role). The engine enforces these rules; never approve on the user's behalf.
+- If `status` is `waiting_approval`, show `pending_approval.message`, the required `role`, whether the person who started the run is excluded (`exclude_runner`), and the expiry. If the current user may approve, ask them and call `approve_step` with their decision and note. Otherwise tell them who must approve (someone with that role); approvers find the run with `list_pending_approvals` or `/approve`. The engine enforces these rules; never approve on the user's behalf.
 - If the engine says the run state is temporarily unavailable, explain that the run is safe and will continue when workers return, and check again shortly.
 - If `status` is `failed`, show `error` and the failing step, and suggest the next action.
 
@@ -55,3 +55,7 @@ When `status` is `completed`:
 - Steps run on the engine's worker pools. AI steps run in Claude Agent SDK sessions that load only the step's plugin and skill, with no shell or network tools; the user's own Claude Code setup is never used or changed.
 - Runs are durable: they survive engine and worker restarts on their own, so there is no resume step.
 - Reproducibility levels per step: `exact` (code), `snapshot` (data captured from a tool), `replayable` (AI output recorded), `human` (approval).
+
+## Approving other people's runs
+
+If the user is an approver (for example a finance or ops lead) and asks what is waiting for them, call `list_pending_approvals`. They can read those runs with `get_run` while the approval is pending (read-only), then decide with `approve_step`. `list_runs` shows only the user's own runs (all runs for auditors and admins), so it is not the way to find approvals.

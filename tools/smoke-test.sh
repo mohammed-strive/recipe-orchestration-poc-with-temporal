@@ -28,7 +28,13 @@ for _ in $(seq 1 60); do
       step=$(printf "%s" "$state" | field 'd=>d.pending_approval.step_id')
       echo "3. Approval requested at $step: $(printf "%s" "$state" | field 'd=>d.pending_approval.message')"
       echo "   The analyst may not approve their own run: $(mcp approve_step "{\"run_id\":\"$run\",\"step_id\":\"$step\",\"decision\":\"approve\"}" 2>&1 | tail -1)"
-      RECIPE_ENGINE_TOKEN=dev-lead-token tools/mcp.sh engine approve_step "{\"run_id\":\"$run\",\"step_id\":\"$step\",\"decision\":\"approve\",\"note\":\"smoke test\"}" >/dev/null
+      # The lead finds the run among the approvals waiting for them and can read it before deciding.
+      lead() { RECIPE_ENGINE_TOKEN=dev-lead-token tools/mcp.sh engine "$1" "$2"; }
+      listed=$(lead list_pending_approvals '{}' | field "d=>d.some(x=>x.run_id==='$run')")
+      [ "$listed" = "true" ] || { echo "   FAIL: run not in the lead's pending approvals"; exit 1; }
+      seen=$(lead get_run "{\"run_id\":\"$run\"}" | field 'd=>d.pending_approval.step_id')
+      echo "   The finance lead sees it in list_pending_approvals and reads it (pending: $seen)"
+      lead approve_step "{\"run_id\":\"$run\",\"step_id\":\"$step\",\"decision\":\"approve\",\"note\":\"smoke test\"}" >/dev/null
       echo "   Approved by the finance lead" ;;
     completed) break ;;
     failed) echo "Run failed: $(printf "%s" "$state" | field 'd=>d.error')"; exit 1 ;;

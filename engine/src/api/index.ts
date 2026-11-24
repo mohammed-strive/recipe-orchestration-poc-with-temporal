@@ -55,7 +55,19 @@ async function view(handle: WorkflowHandle<typeof recipeRun>): Promise<RunView> 
   }
 }
 
-/** Loads a run the caller may see: its owner, an auditor or an admin. */
+/** True when the caller could give the approval this run is waiting for (role and separation of duties). */
+function canApprove(p: Principal, v: RunView): boolean {
+  const a = v.pending_approval;
+  if (!a || v.status !== "waiting_approval") return false;
+  if (a.role && !p.roles.includes(a.role) && !can(p, "admin")) return false;
+  return !(a.exclude_runner && v.user === p.user);
+}
+
+/**
+ * Loads a run the caller may see: its owner, an auditor, an admin, or (read-only, while the
+ * run waits for them) someone who may give the pending approval. Approvers must be able to
+ * see the run to decide on it.
+ */
 async function readable(p: Principal, runId: string, write = false) {
   const handle = temporal.workflow.getHandle<typeof recipeRun>(runId);
   let v: RunView;
@@ -65,7 +77,7 @@ async function readable(p: Principal, runId: string, write = false) {
     if (err instanceof WorkflowNotFoundError) throw new Error(`Unknown run ${runId}`);
     throw err;
   }
-  const allowed = v.user === p.user || can(p, "admin") || (!write && can(p, "auditor"));
+  const allowed = v.user === p.user || can(p, "admin") || (!write && (can(p, "auditor") || canApprove(p, v)));
   if (!allowed) throw new Error(`Unknown run ${runId}`); // do not reveal other users' runs
   return { handle, v };
 }
@@ -223,15 +235,35 @@ function buildServer(p: Principal): McpServer {
   });
 
   server.registerTool("list_runs", {
-    title: "List runs", description: "Recent runs, newest first. Auditors see every user's runs.",
+    title: "List runs", description: "Recent runs, newest first: your own, plus every user's for auditors and admins. Approvers: use list_pending_approvals.",
     inputSchema: { limit: z.number().int().optional() },
   }, async ({ limit }) => {
     const out: unknown[] = [];
     for await (const w of temporal.workflow.list({ query: `WorkflowType = 'recipeRun'` })) {
       const memo = (w.memo ?? {}) as { user?: string; recipe?: string; mode?: string };
-      if (memo.user !== p.user && !can(p, "auditor")) continue;
+      if (memo.user !== p.user && !can(p, "auditor") && !can(p, "admin")) continue;
       out.push({ run_id: w.workflowId, recipe: memo.recipe, mode: memo.mode, user: memo.user, temporal_status: w.status.name, started: w.startTime });
       if (out.length >= (limit ?? 20)) break;
+    }
+    return ok(out);
+  });
+
+  server.registerTool("list_pending_approvals", {
+    title: "List approvals waiting for me",
+    description: "Runs of any user that are waiting for an approval you may give (your roles, and not your own run where the recipe excludes the runner).",
+    inputSchema: {},
+  }, async () => {
+    const out: unknown[] = [];
+    for await (const w of temporal.workflow.list({ query: `WorkflowType = 'recipeRun' AND ExecutionStatus = 'Running'` })) {
+      let v: RunView;
+      try {
+        v = await view(temporal.workflow.getHandle<typeof recipeRun>(w.workflowId));
+      } catch {
+        continue; // state unavailable (no worker answering); it shows up again when workers return
+      }
+      if (!canApprove(p, v)) continue;
+      const a = v.pending_approval!;
+      out.push({ run_id: v.run_id, recipe: v.recipe_id, started_by: v.user, step_id: a.step_id, message: a.message, role: a.role, expires_at: a.expires_at });
     }
     return ok(out);
   });
